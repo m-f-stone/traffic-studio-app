@@ -1,0 +1,33 @@
+# Development dependencies for Traffic Studio
+# Includes testing, type checking, and linting tools
+
+# Core dependencies
+-r requirements.txt
+
+# PyTorch (CUDA 11.8 for development)
+# For CPU-only or different CUDA version, install manually:
+# CPU: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# CUDA 12.1: pip install torch torchvision
+--extra-index-url https://download.pytorch.org/whl/cu118
+torch
+torchvision
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-mock>=3.11.1
+
+# Type checking
+mypy>=1.5.0
+types-Pillow
+
+# Code formatting
+black>=23.7.0
+isort>=5.12.0
+
+# Linting
+flake8>=6.1.0
+pylint>=2.17.5
+
+# Packaging
+pyinstaller>=5.13.0
