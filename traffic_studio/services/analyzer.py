@@ -77,32 +77,22 @@ class AnalyzerService:
         if progress_callback:
             progress_callback(0.2, "Running tracking analysis...")
 
-        # Run tracking analysis using third_party script
-        # Note: This still uses sys.argv manipulation but is isolated to service layer
+        # Run tracking analysis via direct-call API (thread-safe)
         try:
-            from third_party.traffic_analysis_tracking import main as ta_main
-            import sys
+            from third_party.traffic_analysis_tracking import run_analysis
 
-            # Build CLI arguments
-            argv_backup = sys.argv[:]
-            sys.argv = [
-                "traffic_analysis_tracking.py",
-                str(config.video),
-                "--model", str(config.model_path),
-                "--output", str(config.output_dir),
-                "--run", config.run_name,
-                "--tracker", config.tracker,
-                "--imgsz", str(config.imgsz),
-                "--rois", str(flat_json),
-                "--conf", str(config.conf),
-                "--iou", str(config.iou),
-                "--device", str(config.device)
-            ]
-
-            try:
-                ta_main()
-            finally:
-                sys.argv = argv_backup
+            run_analysis(
+                input_video=str(config.video),
+                model=str(config.model_path),
+                output=str(config.output_dir),
+                run=config.run_name,
+                rois_path=str(flat_json),
+                tracker=config.tracker,
+                imgsz=config.imgsz,
+                conf=config.conf,
+                iou=config.iou,
+                device=config.device
+            )
 
         except Exception as e:
             self.logger.exception("Tracking analysis failed")

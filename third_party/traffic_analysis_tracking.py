@@ -29,7 +29,8 @@ def load_rois(roi_path):
       }
     }
     """
-    raw = json.load(open(roi_path, "r"))
+    with open(roi_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
     calib = raw.pop("calibration", None)
 
     # Clean duplicate end-points if any
@@ -186,19 +187,6 @@ def streaming_patterns(
     last_seen = {}  # tid -> frame_idx
     end_buffer = 30  # frames
 
-    # helper: ROI name for a point
-    def roi_name_for(x, y):
-        if not roi_polygons:
-            return None
-        pt = Point(x, y) if not world_mode else Point(x, y)  # same geometry
-        for rn, poly in roi_polygons.items():
-            # ROIs are defined in image pixels; for homography we drew on pixels.
-            # So test in IMAGE PIXELS, not world coords:
-            pass
-        # we need the image-pixel test; caller provides pixel (cx, cy)
-        return None
-
-    # We'll pass pixel coords to ROI test separately:
     def roi_name_pixel(cx, cy):
         if not roi_polygons:
             return None
@@ -371,6 +359,30 @@ def streaming_patterns(
     return tracks_csv, moves_csv, video_out
 
 
+def run_analysis(input_video, model, output, run, rois_path,
+                 tracker="strongsort.yaml", imgsz=640,
+                 conf=0.30, iou=0.50, device=None):
+    """Direct-call API for running traffic analysis (no sys.argv manipulation).
+
+    Returns:
+        tuple of (tracks_csv, moves_csv, video_out) Paths
+    """
+    rois, calib = load_rois(rois_path)
+    return streaming_patterns(
+        model_path=model,
+        input_video=input_video,
+        output_dir=output,
+        run_name=run,
+        tracker_cfg=tracker,
+        imgsz=imgsz,
+        roi_polygons=rois,
+        calib=calib,
+        conf=conf,
+        iou=iou,
+        device=device
+    )
+
+
 def main():
     ap = argparse.ArgumentParser(description="Traffic patterns with tracking, ROI paths, and speeds")
     ap.add_argument("input_video")
@@ -385,19 +397,11 @@ def main():
     ap.add_argument("--device", default=None, help="e.g., '0' for CUDA:0")
     args = ap.parse_args()
 
-    rois, calib = load_rois(args.rois)
-    tracks_csv, moves_csv, video_out = streaming_patterns(
-        model_path=args.model,
-        input_video=args.input_video,
-        output_dir=args.output,
-        run_name=args.run,
-        tracker_cfg=args.tracker,
-        imgsz=args.imgsz,
-        roi_polygons=rois,
-        calib=calib,
-        conf=args.conf,
-        iou=args.iou,
-        device=args.device
+    tracks_csv, moves_csv, video_out = run_analysis(
+        input_video=args.input_video, model=args.model,
+        output=args.output, run=args.run, rois_path=args.rois,
+        tracker=args.tracker, imgsz=args.imgsz,
+        conf=args.conf, iou=args.iou, device=args.device
     )
     print(f"Per-track metrics: {tracks_csv}")
     print(f"Movement (O-D) counts: {moves_csv}")

@@ -7,7 +7,7 @@ They enable:
 3. Interface-based programming
 """
 
-from typing import Protocol, Optional, Callable
+from typing import Protocol, Optional, Callable, runtime_checkable
 from ..domain import (
     SamplerConfig,
     SamplerResult,
@@ -20,6 +20,7 @@ from ..domain import (
 )
 
 
+@runtime_checkable
 class ISamplerService(Protocol):
     """Protocol for video frame sampling service."""
 
@@ -42,6 +43,7 @@ class ISamplerService(Protocol):
         ...
 
 
+@runtime_checkable
 class IAutolabelService(Protocol):
     """Protocol for auto-labeling service."""
 
@@ -64,6 +66,7 @@ class IAutolabelService(Protocol):
         ...
 
 
+@runtime_checkable
 class ITrainerService(Protocol):
     """Protocol for model training service."""
 
@@ -86,6 +89,7 @@ class ITrainerService(Protocol):
         ...
 
 
+@runtime_checkable
 class IAnalyzerService(Protocol):
     """Protocol for traffic analysis service."""
 
@@ -108,6 +112,7 @@ class IAnalyzerService(Protocol):
         ...
 
 
+@runtime_checkable
 class IDependencyCheckService(Protocol):
     """Protocol for dependency checking service."""
 

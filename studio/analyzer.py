@@ -92,7 +92,7 @@ def analyze_video(video: Path, model_path: Path, roi_json_template: Path,
     for names matching `lane_pattern`, then runs your analyzer. Finally, post-process
     per-track results to add approach/L/T/R labels and an aggregate CSV.
     """
-    from third_party.traffic_analysis_tracking import main as ta_main
+    from third_party.traffic_analysis_tracking import run_analysis
 
     out_dir.mkdir(parents=True, exist_ok=True)
     # Normalize ROI JSON for tracking script
@@ -101,26 +101,19 @@ def analyze_video(video: Path, model_path: Path, roi_json_template: Path,
                            include_lanes=include_lane_rois,
                            lane_pattern=lane_pattern)
 
-    # Build CLI argv to call your analyzer's main()
-    import sys
-    argv_backup = sys.argv[:]
-    sys.argv = [
-        "traffic_analysis_tracking.py",
-        str(video),
-        "--model", str(model_path),
-        "--output", str(out_dir),
-        "--run", run_name,
-        "--tracker", tracker,
-        "--imgsz", str(imgsz),
-        "--rois", str(flat_json),
-        "--conf", str(conf),
-        "--iou", str(iou),
-        "--device", str(device)
-    ]
-    try:
-        ta_main()
-    finally:
-        sys.argv = argv_backup
+    # Run tracking analysis via direct-call API (thread-safe)
+    run_analysis(
+        input_video=str(video),
+        model=str(model_path),
+        output=str(out_dir),
+        run=run_name,
+        rois_path=str(flat_json),
+        tracker=tracker,
+        imgsz=imgsz,
+        conf=conf,
+        iou=iou,
+        device=device
+    )
 
     # Post-process to add L/T/R
     _postprocess_ltr(out_dir, run_name)

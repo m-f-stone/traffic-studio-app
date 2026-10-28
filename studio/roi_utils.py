@@ -70,6 +70,70 @@ def crop_margin_and_relabel(images_dir: Path, out_images_dir: Path,
                 n_lbl += 1
     return n_img, n_lbl
 
+def load_roi_any(path: Path) -> dict:
+    """Load ROI JSON in any supported format and return normalised dict.
+
+    Handles:
+      - New schema: {"meta": {...}, "rois": {"name": {"points": [...], "include": bool}}}
+      - Legacy flat: {"name": [[x,y], ...], ...}  (optional "calibration" key stripped)
+
+    Returns:
+        dict of {name: {"points": [[x,y], ...], "include": bool}}
+    """
+    with Path(path).open("r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    # New schema produced by ROI Studio
+    if "rois" in raw and isinstance(raw["rois"], dict):
+        return {name: {"points": spec.get("points", []),
+                        "include": spec.get("include", True)}
+                for name, spec in raw["rois"].items()}
+
+    # Legacy flat format — every key except "calibration" is a polygon
+    rois = {}
+    for name, pts in raw.items():
+        if name == "calibration":
+            continue
+        if isinstance(pts, list):
+            rois[name] = {"points": pts, "include": True}
+    return rois
+
+
+def mask_from_rois(flat_rois: dict, w: int, h: int) -> np.ndarray:
+    """Create a binary uint8 mask (255 inside union of polygons, 0 outside).
+
+    Args:
+        flat_rois: {name: [[x,y], ...]} — flat polygon mapping
+        w: image width in pixels
+        h: image height in pixels
+
+    Returns:
+        numpy array of shape (h, w) with dtype uint8
+    """
+    mask = np.zeros((h, w), dtype=np.uint8)
+    for pts in flat_rois.values():
+        if isinstance(pts, list) and len(pts) >= 3:
+            arr = np.array(pts, np.int32).reshape(-1, 1, 2)
+            cv2.fillPoly(mask, [arr], 255)
+    return mask
+
+
+def apply_mask_to_image(src_path: Path, dst_path: Path, mask: np.ndarray):
+    """Read an image, zero out pixels outside the mask, and write to dst_path.
+
+    Args:
+        src_path: source image file
+        dst_path: destination image file
+        mask: binary uint8 mask (255 = keep, 0 = black)
+    """
+    img = cv2.imread(str(src_path))
+    if img is None:
+        return
+    masked = cv2.bitwise_and(img, img, mask=mask)
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(dst_path), masked)
+
+
 def normalize_for_tracking(template_path: Path,
                            out_path: Path,
                            include_lanes: bool = False,
@@ -92,5 +156,6 @@ def normalize_for_tracking(template_path: Path,
                 spec["include"] = True
 
     flat = {name: spec["points"] for name, spec in rois.items() if spec.get("include", True)}
-    json.dump(flat, out_path.open("w"), indent=2)
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(flat, f, indent=2)
     return out_path

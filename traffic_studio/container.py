@@ -163,26 +163,27 @@ class MockContainer(Container):
     """Mock container for testing.
 
     Provides mock implementations of services for unit testing.
-    Override service methods to return mocks.
+    Override service methods to return mocks, or inject real
+    services via the set_*() methods.
 
     Example:
-        class TestMyCode:
-            def test_something(self):
-                container = MockContainer()
-                # Test code that uses container.sampler_service()
+        container = MockContainer()
+        service = container.sampler_service()  # returns MagicMock
     """
 
     def __init__(self):
         """Initialize mock container."""
+        from unittest.mock import MagicMock
+
         # Don't call super().__init__() to avoid creating real infrastructure
         self._logger = create_logger("test")
-        self._config_manager = None
+        self._config_manager = MagicMock(spec=UserConfigManager)
 
         # Mock infrastructure
-        self._ffmpeg = None
-        self._yolo = None
+        self._ffmpeg = MagicMock(spec=FFmpegRunner)
+        self._yolo = MagicMock(spec=YOLORunner)
 
-        # Mock services
+        # Mock services (created on first access)
         self._sampler = None
         self._autolabel = None
         self._trainer = None
@@ -192,9 +193,34 @@ class MockContainer(Container):
     def sampler_service(self) -> SamplerService:
         """Get mock sampler service."""
         if self._sampler is None:
-            # Return a mock - for now just return None
-            # In real tests, you'd inject a proper mock here
-            pass
+            from unittest.mock import MagicMock
+            self._sampler = MagicMock(spec=SamplerService)
         return self._sampler
 
-    # Similar for other services...
+    def autolabel_service(self) -> AutolabelService:
+        """Get mock autolabel service."""
+        if self._autolabel is None:
+            from unittest.mock import MagicMock
+            self._autolabel = MagicMock(spec=AutolabelService)
+        return self._autolabel
+
+    def trainer_service(self) -> TrainerService:
+        """Get mock trainer service."""
+        if self._trainer is None:
+            from unittest.mock import MagicMock
+            self._trainer = MagicMock(spec=TrainerService)
+        return self._trainer
+
+    def analyzer_service(self) -> AnalyzerService:
+        """Get mock analyzer service."""
+        if self._analyzer is None:
+            from unittest.mock import MagicMock
+            self._analyzer = MagicMock(spec=AnalyzerService)
+        return self._analyzer
+
+    def dependency_check_service(self) -> DependencyCheckService:
+        """Get mock dependency check service."""
+        if self._dependency_check is None:
+            from unittest.mock import MagicMock
+            self._dependency_check = MagicMock(spec=DependencyCheckService)
+        return self._dependency_check

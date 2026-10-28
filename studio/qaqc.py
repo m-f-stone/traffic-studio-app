@@ -9,14 +9,14 @@ log = setup_logger()
 def _read_lines(path: Path) -> list[str]:
     if not path.exists():
         return []
-    with path.open('r', newline='') as f:
+    with path.open('r', newline='', encoding='utf-8') as f:
         return [ln.rstrip("\n\r") for ln in f.readlines()]
 
 def _write_lines(path: Path, lines: list[str], dry_run: bool) -> bool:
     if dry_run:
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open('w', newline='\n') as f:
+    with path.open('w', newline='\n', encoding='utf-8') as f:
         for o in lines:
             f.write(o + '\n')
     return True
@@ -61,7 +61,7 @@ def validate_labels(labels_dir: Path) -> dict:
                 rows.append([str(path), i, "malformed", ln]); continue
             try:
                 cls = int(parts[0]); x,y,w,h = map(float, parts[1:5])
-            except Exception:
+            except (ValueError, IndexError):
                 issues["non_numeric"] += 1
                 rows.append([str(path), i, "non_numeric", ln]); continue
             if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 and 0.0 <= w <= 1.0 and 0.0 <= h <= 1.0):

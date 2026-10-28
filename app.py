@@ -382,7 +382,7 @@ class ValidatedEntry(ttk.Entry):
         self.validator = validator
         self.required = required
         self.textvariable = textvariable
-        self.indicator = ttk.Label(parent, text="", width=2)
+        self.indicator = ttk.Label(parent, text="", width=8)
 
         # Validate on focus out
         self.bind("<FocusOut>", self._validate)
@@ -407,9 +407,9 @@ class ValidatedEntry(ttk.Entry):
         self.is_valid = valid
 
         if valid:
-            self.indicator.config(text="✓", foreground="green")
+            self.indicator.config(text="\u2713 OK", foreground="green")
         else:
-            self.indicator.config(text="✗", foreground="red")
+            self.indicator.config(text="\u2717 Invalid", foreground="red")
 
     def grid(self, **kwargs):
         """Override grid to auto-place indicator to the right."""
@@ -550,8 +550,8 @@ def load_recent_projects() -> list:
         if RECENT_PROJECTS_FILE.exists():
             with open(RECENT_PROJECTS_FILE, 'r') as f:
                 return json.load(f)
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("Failed to load recent projects: %s", e)
     return []
 
 
@@ -561,8 +561,8 @@ def save_recent_projects(projects: list):
         RECENT_PROJECTS_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(RECENT_PROJECTS_FILE, 'w') as f:
             json.dump(projects[:MAX_RECENT_PROJECTS], f, indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("Failed to save recent projects: %s", e)
 
 
 def add_recent_project(path: Path):
@@ -578,15 +578,25 @@ class TrafficStudio(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Traffic Studio — Sampling · ROI · Autolabel · Train · Analyze")
-        self.geometry("1280x780"); self.minsize(1100, 680)
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        w = min(1280, int(screen_w * 0.85))
+        h = min(780, int(screen_h * 0.85))
+        x = (screen_w - w) // 2
+        y = max(0, (screen_h - h) // 2 - 30)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.minsize(min(1100, w), min(680, h))
 
         # ---- Apply consistent style (ROI Tool base / fallback) ----
         try:
             # If ROI tool exposes a style helper, prefer that
             from third_party.roi_tool_style import apply_roi_style
             apply_roi_style(self)
-        except Exception:
+        except ImportError:
             apply_theme_base(self)  # fallback theme for consistency
+        except Exception as e:
+            log.warning("Theme application failed: %s", e)
+            apply_theme_base(self)
 
         # ---- Project Model ----
         self.project = ProjectModel()
@@ -686,6 +696,7 @@ class TrafficStudio(tk.Tk):
         self._build_ui()
         self.after(100, self._drain_logs)
         self.after(500, self._update_workflow_status)  # Initial status update after UI is built
+        self.protocol("WM_DELETE_WINDOW", self._on_closing)
 
     # ----------------- Presets helpers -----------------
     def _ensure_preset_file(self):
@@ -696,7 +707,8 @@ class TrafficStudio(tk.Tk):
     def _load_presets(self):
         try:
             return json.loads(PRESET_FILE.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception as e:
+            log.warning("Failed to load presets: %s", e)
             return {}
 
     def _save_presets(self, d):
@@ -1185,6 +1197,8 @@ class TrafficStudio(tk.Tk):
 
     def _do_sample(self):
         """Run frame sampling with validation and progress tracking."""
+        # Sync UI → project model before checking prerequisites
+        self._sync_project_from_ui()
         # Check prerequisites with soft warnings
         can_proceed, message, severity = PrerequisiteChecker.can_sample(self.project)
         if not can_proceed:
@@ -1325,7 +1339,7 @@ class TrafficStudio(tk.Tk):
             messagebox.showwarning("No images", f"No images in {images_for_mask}"); return
         im = cv2.imread(str(probe)); h, w = im.shape[:2]
         rois = roi_utils.load_roi_any(Path(self.roi_json.get()))
-        flat = roi_utils.normalize_for_tracking(rois, w, h)
+        flat = {name: spec["points"] for name, spec in rois.items() if spec.get("include", True)}
         mask = roi_utils.mask_from_rois(flat, w, h)
         out_dir = Path(self.mask_out.get()); out_dir.mkdir(parents=True, exist_ok=True)
         for p in sorted(images_for_mask.glob("*.*")):
@@ -1451,6 +1465,7 @@ class TrafficStudio(tk.Tk):
 
     def _do_autolabel(self):
         """Run autolabeling with validation and progress tracking."""
+        self._sync_project_from_ui()
         # Check prerequisites with soft warnings
         can_proceed, message, severity = PrerequisiteChecker.can_autolabel(self.project)
         if not can_proceed:
@@ -1875,16 +1890,38 @@ class TrafficStudio(tk.Tk):
 
     def _do_validate(self):
         labels_dir = Path(self.qalabels_dir.get())
-        self._run_task(lambda: qaqc.validate_labels(labels_dir), "Validate Labels")
+        def on_val_success(result):
+            if result:
+                msg = (f"Validation complete:\n"
+                       f"  Files checked: {result.get('total_files', 0)}\n"
+                       f"  Malformed: {result.get('malformed', 0)}\n"
+                       f"  Non-numeric: {result.get('non_numeric', 0)}\n"
+                       f"  Out of bounds: {result.get('out_of_bounds', 0)}\n"
+                       f"  Non-positive w/h: {result.get('non_positive_wh', 0)}\n"
+                       f"  Empty files: {result.get('empty_files', 0)}\n\n"
+                       f"Details saved to: {result.get('issues_csv', 'N/A')}")
+                self.after(0, lambda: messagebox.showinfo("Validation Results", msg))
+        self._run_task(lambda: qaqc.validate_labels(labels_dir), "Validate Labels",
+                       on_success=on_val_success)
 
     def _do_cleanup(self):
+        dry = bool(self.qa_dry.get())
+        if not dry:
+            if not messagebox.askyesno("Confirm Cleanup",
+                    "This will permanently modify label files.\n"
+                    "Are you sure you want to proceed?\n\n"
+                    "(Tip: enable Dry Run to preview changes first.)"):
+                return
         labels_dir = Path(self.qalabels_dir.get())
         delete_lines = [s.strip() for s in self.qa_delete_line.get().split("\n") if s.strip()]
         delete_classes = [int(x) for x in re.split(r"[\s,]+", self.qa_delete_class.get().strip()) if x.strip().isdigit()]
         delete_regex = [s.strip() for s in re.split(r"[\n]+", self.qa_delete_regex.get().strip()) if s.strip()]
         delete_near = [s.strip() for s in self.qa_delete_near.get().split("\n") if s.strip()]
-        eps = float(self.qa_eps.get() or "0.0")
-        dry = bool(self.qa_dry.get())
+        try:
+            eps = float(self.qa_eps.get() or "0.0")
+        except ValueError:
+            messagebox.showerror("Invalid Parameter", "Epsilon must be a number.")
+            return
         self._run_task(lambda: qaqc.cleanup_labels(labels_dir,
                                                    delete_lines=delete_lines,
                                                    delete_classes=delete_classes,
@@ -1896,8 +1933,25 @@ class TrafficStudio(tk.Tk):
         images_root = Path(self.split_images_root.get())
         labels_root = Path(self.split_labels_root.get() or images_root.parent / "labels" / images_root.name)
         out_root = Path(self.split_out_root.get())
+        if out_root.exists() and any(out_root.iterdir()):
+            if not messagebox.askyesno("Confirm Splits",
+                    f"Output directory already contains files:\n{out_root}\n\n"
+                    "Existing files may be overwritten. Continue?"):
+                return
         site_regex = self.split_site_regex.get().strip() or None
-        tr, va, te = float(self.split_train.get()), float(self.split_val.get()), float(self.split_test.get())
+        try:
+            tr = float(self.split_train.get())
+            va = float(self.split_val.get())
+            te = float(self.split_test.get())
+        except ValueError:
+            messagebox.showerror("Invalid Split Ratios", "Train, val, and test ratios must be numbers.")
+            return
+        if not (0.0 < tr <= 1.0 and 0.0 <= va <= 1.0 and 0.0 <= te <= 1.0):
+            messagebox.showerror("Invalid Split Ratios", "Split ratios must be between 0 and 1.")
+            return
+        if abs(tr + va + te - 1.0) > 0.05:
+            messagebox.showerror("Invalid Split Ratios", f"Ratios sum to {tr+va+te:.2f} — they should sum to ~1.0.")
+            return
         classes_txt = Path(self.classes_file.get()) if self.classes_file.get() else None
         self._run_task(lambda: qaqc.make_site_disjoint_splits(images_root, labels_root, out_root,
                                                               train=tr, val=va, test=te, site_regex=site_regex,
@@ -1906,7 +1960,11 @@ class TrafficStudio(tk.Tk):
 
     def _do_write_fhwa_template(self):
         out_csv = Path(self.split_out_root.get()) / "fhwa_mapping.csv"
-        self._run_task(lambda: qaqc.write_fhwa_mapping_csv(out_csv), "FHWA Mapping")
+        def on_fhwa_success(result):
+            self.after(0, lambda: messagebox.showinfo("FHWA Template",
+                    f"FHWA mapping template written to:\n{result}"))
+        self._run_task(lambda: qaqc.write_fhwa_mapping_csv(out_csv), "FHWA Mapping",
+                       on_success=on_fhwa_success)
 
     # ---------- Bulk CLI wrapper ----------
     def _do_cli_bulk_tool(self):
@@ -2134,6 +2192,7 @@ class TrafficStudio(tk.Tk):
         return f
 
     def _do_train(self):
+        self._sync_project_from_ui()
         # Check prerequisites with soft warnings
         can_proceed, message, severity = PrerequisiteChecker.can_train(self.project)
         if not can_proceed:
@@ -2147,24 +2206,46 @@ class TrafficStudio(tk.Tk):
         data_yaml = self.train_data_yaml.get()
         weights = self.train_weights.get()
         run_name = self.train_out_name.get()
-        imgsz = int(float(self.t_imgsz.get()))
-        epochs = int(float(self.t_epochs.get()))
-        batch = int(float(self.t_batch.get()))
-        device = int(float(self.t_device.get()))
-        workers = int(float(self.t_workers.get()))
-        mosaic = float(self.t_mosaic.get())
-        mixup = float(self.t_mixup.get())
-        copy_paste = float(self.t_copy_paste.get())
-        degrees = float(self.t_degrees.get())
-        fl_gamma = self.t_fl_gamma.get().strip()
-        fl_gamma = float(fl_gamma) if fl_gamma else None
-        warmup = float(self.t_warmup.get())
-        close_mosaic = int(float(self.t_close_mosaic.get()))
-        lr0 = self.t_lr0.get().strip(); lr0 = float(lr0) if lr0 else None
-        lrf = self.t_lrf.get().strip(); lrf = float(lrf) if lrf else None
-        freeze = self.t_freeze.get().strip() or None
-        optimizer = self.t_optimizer.get().strip() or None
-        cos_lr = bool(self.t_cos_lr.get())
+
+        try:
+            imgsz = int(float(self.t_imgsz.get()))
+            epochs = int(float(self.t_epochs.get()))
+            batch = int(float(self.t_batch.get()))
+            device = int(float(self.t_device.get()))
+            workers = int(float(self.t_workers.get()))
+            mosaic = float(self.t_mosaic.get())
+            mixup = float(self.t_mixup.get())
+            copy_paste = float(self.t_copy_paste.get())
+            degrees = float(self.t_degrees.get())
+            fl_gamma = self.t_fl_gamma.get().strip()
+            fl_gamma = float(fl_gamma) if fl_gamma else None
+            warmup = float(self.t_warmup.get())
+            close_mosaic = int(float(self.t_close_mosaic.get()))
+            lr0 = self.t_lr0.get().strip(); lr0 = float(lr0) if lr0 else None
+            lrf = self.t_lrf.get().strip(); lrf = float(lrf) if lrf else None
+            freeze = self.t_freeze.get().strip() or None
+            optimizer = self.t_optimizer.get().strip() or None
+            cos_lr = bool(self.t_cos_lr.get())
+        except (ValueError, TypeError) as e:
+            messagebox.showerror("Invalid Parameter", f"Please check training parameters:\n{e}")
+            return
+
+        # Bounds validation
+        errors = []
+        if epochs < 1:
+            errors.append("Epochs must be at least 1.")
+        if imgsz < 32 or imgsz % 32 != 0:
+            errors.append("Image size must be a multiple of 32 (e.g. 320, 640, 960).")
+        if batch < -1 or batch == 0:
+            errors.append("Batch size must be -1 (auto) or a positive integer.")
+        if workers < 0:
+            errors.append("Workers must be 0 or greater.")
+        for name_val, val in [("mosaic", mosaic), ("mixup", mixup), ("copy_paste", copy_paste)]:
+            if not (0.0 <= val <= 1.0):
+                errors.append(f"{name_val} must be between 0.0 and 1.0.")
+        if errors:
+            messagebox.showerror("Invalid Parameters", "\n".join(errors))
+            return
 
         def on_success_train(res):
             self.project.steps_completed.update({"train": True})
@@ -2243,6 +2324,7 @@ class TrafficStudio(tk.Tk):
         return f
 
     def _do_analyze(self):
+        self._sync_project_from_ui()
         # Check prerequisites with soft warnings
         can_proceed, message, severity = PrerequisiteChecker.can_analyze(self.project)
         if not can_proceed:
@@ -2302,6 +2384,11 @@ class TrafficStudio(tk.Tk):
             cancel_button: Optional cancel button to enable during task
             output_discovery: Optional frame to show after successful completion
         """
+        # Reject if another task is still running
+        if self.current_worker and self.current_worker.is_alive():
+            messagebox.showwarning(title, "Another task is already running. Please wait or cancel it first.")
+            return
+
         # Show progress UI
         if progress_bar:
             progress_bar.grid()
@@ -2353,18 +2440,32 @@ class TrafficStudio(tk.Tk):
             else:
                 self.after(0, lambda: messagebox.showerror(title, "Task failed. See log for details."))
 
-            # Clear current worker reference
-            self.current_worker = None
+            # Clear current worker reference on main thread (avoid race with new task)
+            def _clear_worker():
+                if self.current_worker is worker:
+                    self.current_worker = None
+            self.after(0, _clear_worker)
 
         # Start worker
-        self.current_worker = Worker(fn, on_done, log, on_progress=on_progress)
-        self.current_worker.start()
+        worker = Worker(fn, on_done, log, on_progress=on_progress)
+        self.current_worker = worker
+        worker.start()
 
     def _cancel_current_task(self):
         """Cancel the currently running task."""
         if self.current_worker:
             self.current_worker.cancel()
             log.info("Cancel requested for current task.")
+
+    def _on_closing(self):
+        """Handle window close — warn if task running."""
+        if self.current_worker and self.current_worker.is_alive():
+            if not messagebox.askyesno("Task Running",
+                    "A task is still running. Are you sure you want to quit?\n"
+                    "The running task will be terminated."):
+                return
+            self.current_worker.cancel()
+        self.destroy()
 
     def _choose_file(self, var, types):
         p = filedialog.askopenfilename(filetypes=types)
