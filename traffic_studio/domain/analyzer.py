@@ -15,7 +15,7 @@ class AnalyzerConfig:
         roi_json: Path to ROI JSON configuration
         output_dir: Directory for analysis outputs
         run_name: Name for this analysis run
-        tracker: Tracker configuration (e.g., 'strongsort.yaml')
+        tracker: Tracker configuration (bytetrack.yaml or botsort.yaml)
         imgsz: Image size for inference
         conf: Confidence threshold
         iou: IOU threshold
@@ -30,11 +30,11 @@ class AnalyzerConfig:
     roi_json: Path
     output_dir: Path
     run_name: str = "analysis"
-    tracker: str = "strongsort.yaml"
+    tracker: str = "bytetrack.yaml"
     imgsz: int = 640
     conf: float = 0.30
     iou: float = 0.50
-    device: str | int = 0
+    device: str | int = "auto"
     include_lane_rois: bool = False
     lane_pattern: str = r"(lane|_ln|\b[ltr]\b|through|left|right)"
     bin_minutes: int = 15

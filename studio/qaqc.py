@@ -212,13 +212,13 @@ def make_site_disjoint_splits(images_root: Path, labels_root: Path, out_root: Pa
     if classes_txt and Path(classes_txt).exists():
         names = [ln.strip() for ln in Path(classes_txt).read_text().splitlines() if ln.strip()]
     data_yaml = out_root / "data.yaml"
-    with data_yaml.open("w") as f:
-        f.write(f"path: {out_root}\\n")
-        f.write("train: images/train\\nval: images/val\\ntest: images/test\\n")
+    with data_yaml.open("w", encoding="utf-8") as f:
+        f.write(f"path: {out_root.resolve()}\n")
+        f.write("train: images/train\nval: images/val\ntest: images/test\n")
         if names:
-            f.write("names:\\n")
+            f.write("names:\n")
             for i, n in enumerate(names):
-                f.write(f"  {i}: {n}\\n")
+                f.write(f"  {i}: {n}\n")
     log.info("Created site-disjoint dataset at %s (sites=%d)", out_root, len(sites))
     return {"out_root": str(out_root), "sites": len(sites), "data_yaml": str(data_yaml)}
 

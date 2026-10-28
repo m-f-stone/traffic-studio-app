@@ -7,9 +7,13 @@ import sys, re, os, json
 from typing import Optional, Callable, Any
 from datetime import datetime
 
+import multiprocessing
+
 from studio.logutil import setup_logger
 from studio.threads import Worker
 from studio import sampler, roi_utils, autolabel, trainer, analyzer, qaqc
+
+APP_DIR = Path(__file__).resolve().parent   # where app.py and third_party/ live, regardless of cwd
 
 
 # ============================================================================
@@ -120,9 +124,16 @@ class ProjectModel:
         self.an_video = ""
         self.an_roi = ""
         self.an_weights = ""
-        self.an_out = "runs/traffic_analysis"
+        self.an_out = "outputs"
+        self.an_run = "analysis_run"
+        self.an_imgsz = "960"
+        self.an_conf = "0.25"
+        self.an_iou = "0.50"
+        self.an_device = "auto"
+        self.an_write_video = True
         self.an_bin_minutes = "15"
-        self.an_do_lane = False
+        self.an_do_lane = True
+        self.an_lane_pattern = r"(lane|_ln|\b[ltr]\b|through|left|right)"
         self.an_cardinal = False
 
         # Workflow State (for prerequisite tracking)
@@ -137,6 +148,16 @@ class ProjectModel:
             "trained_weights": "",
             "last_autolabel_run": "",
         }
+
+    @property
+    def root(self) -> Path:
+        """Folder that relative project paths (data/, runs/, outputs/) resolve against:
+        the saved project file's folder, or the working directory for an unsaved project."""
+        return self.project_file.parent.resolve() if self.project_file else Path.cwd()
+
+    def resolve(self, p) -> Path:
+        p = Path(p)
+        return p if p.is_absolute() else self.root / p
 
     def detect_workflow_state(self):
         """
@@ -164,7 +185,7 @@ class ProjectModel:
         # Detect trained model
         if self.train_out_name:
             # Look for typical YOLO training output structure
-            weights_path = Path(f"runs/detect/{self.train_out_name}/weights/best.pt")
+            weights_path = self.root / "runs" / "detect" / self.train_out_name / "weights" / "best.pt"
             if weights_path.exists():
                 self.workflow_state["has_trained_model"] = True
                 self.workflow_state["trained_weights"] = str(weights_path)
@@ -692,9 +713,18 @@ class TrafficStudio(tk.Tk):
         self.an_out = tk.StringVar(value="outputs")
         self.include_lanes = tk.BooleanVar(value=True)
         self.lane_pattern = tk.StringVar(value=r"(lane|_ln|\b[ltr]\b|through|left|right)")
+        self.an_imgsz = tk.StringVar(value="960")
+        self.an_conf = tk.StringVar(value="0.25")
+        self.an_iou = tk.StringVar(value="0.50")
+        self.an_device = tk.StringVar(value="auto")
+        self.an_write_video = tk.BooleanVar(value=True)
+
+        # Callables queued by worker threads; drained on the Tk thread (see _drain_ui).
+        self._ui_queue: "queue.Queue[Callable[[], None]]" = queue.Queue()
 
         self._build_ui()
         self.after(100, self._drain_logs)
+        self.after(50, self._drain_ui)
         self.after(500, self._update_workflow_status)  # Initial status update after UI is built
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
 
@@ -861,6 +891,7 @@ class TrafficStudio(tk.Tk):
         """Load project from file and sync UI."""
         try:
             self.project = ProjectModel.load(path)
+            self._enter_project_dir()
             self._sync_ui_from_project()
             self._update_workflow_status()  # Update status indicators after loading
             add_recent_project(path)
@@ -890,10 +921,22 @@ class TrafficStudio(tk.Tk):
         if path:
             self._sync_project_from_ui()
             self.project.save(Path(path))
+            self._enter_project_dir()
             add_recent_project(Path(path))
             self._update_recent_menu()
             self.title(f"Traffic Studio — {Path(path).name}")
             log.info(f"Saved project as: {path}")
+
+    def _enter_project_dir(self):
+        """Make the project folder the working directory, so relative paths in the
+        project (data/, runs/, outputs/) resolve the same way from the GUI, the CLI
+        tools, and a packaged build, wherever the app was launched from."""
+        root = self.project.root
+        try:
+            os.chdir(root)
+            log.info("Working directory: %s", root)
+        except OSError as e:
+            log.warning("Could not change working directory to %s: %s", root, e)
 
     def _sync_ui_from_project(self):
         """Load project state into UI widgets."""
@@ -937,7 +980,17 @@ class TrafficStudio(tk.Tk):
         # Note: These will be loaded when UI is built
 
         # Analyze
-        # Note: These will be loaded when UI is built
+        self.an_video.set(p.an_video)
+        self.an_weights.set(p.an_weights)
+        self.an_out.set(p.an_out)
+        self.an_run.set(p.an_run)
+        self.an_imgsz.set(p.an_imgsz)
+        self.an_conf.set(p.an_conf)
+        self.an_iou.set(p.an_iou)
+        self.an_device.set(p.an_device)
+        self.an_write_video.set(bool(p.an_write_video))
+        self.include_lanes.set(bool(p.an_do_lane))
+        self.lane_pattern.set(p.an_lane_pattern)
 
     def _sync_project_from_ui(self):
         """Save current UI state to project model."""
@@ -976,7 +1029,19 @@ class TrafficStudio(tk.Tk):
         # QA/QC
         p.qalabels_dir = self.qalabels_dir.get()
 
-        # ... Add more fields as needed
+        # Analyze
+        p.an_video = self.an_video.get()
+        p.an_roi = self.roi_json.get()
+        p.an_weights = self.an_weights.get()
+        p.an_out = self.an_out.get()
+        p.an_run = self.an_run.get()
+        p.an_imgsz = self.an_imgsz.get()
+        p.an_conf = self.an_conf.get()
+        p.an_iou = self.an_iou.get()
+        p.an_device = self.an_device.get()
+        p.an_write_video = bool(self.an_write_video.get())
+        p.an_do_lane = bool(self.include_lanes.get())
+        p.an_lane_pattern = self.lane_pattern.get()
 
     def _update_workflow_status(self):
         """
@@ -1076,8 +1141,8 @@ class TrafficStudio(tk.Tk):
         # Create menu bar
         self._build_menu()
 
-        # Check dependencies on startup
-        self._check_dependencies()
+        # Check dependencies once the window is up (importing torch takes seconds)
+        self.after(800, self._check_dependencies)
 
         # Root grid: one column, two rows (tabs on top, log at bottom)
         self.columnconfigure(0, weight=1); self.rowconfigure(0, weight=1)
@@ -1241,8 +1306,12 @@ class TrafficStudio(tk.Tk):
             self.project.workflow_state["sample_output_dir"] = str(out)
             self._update_workflow_status()
 
+        def _run(progress_callback=None, cancel_check=None):
+            return sampler.sample_frames(video, out, every=every, fps=fps, method=method, tolerance=tol,
+                                         progress_callback=progress_callback, cancel_check=cancel_check)
+
         self._run_task(
-            lambda: sampler.sample_frames(video, out, every=every, fps=fps, method=method, tolerance=tol),
+            _run,
             "Sampling",
             on_success=on_success_sample,
             progress_bar=self.sample_progress,
@@ -1294,13 +1363,26 @@ class TrafficStudio(tk.Tk):
         btn_roi_tool.grid(row=3, column=1, sticky="w", pady=6)
         ToolTip(btn_roi_tool, "Launch interactive ROI editor to draw detection zones on video frames.\nSaves ROI configuration to JSON file.")
 
-        btn_mask = ttk.Button(f, text="Apply Mask to Sampled Images", command=self._do_mask)
-        btn_mask.grid(row=4, column=1, sticky="e", pady=6)
-        ToolTip(btn_mask, "Apply ROI mask to all sampled images.\nPixels outside ROI zones will be masked out.")
+        # Progress (hidden until a task starts)
+        self.mask_progress = ttk.Progressbar(f, mode='indeterminate', length=300)
+        self.mask_progress.grid(row=4, column=1, sticky="ew", padx=4, pady=4)
+        self.mask_progress.grid_remove()
+        self.mask_progress_label = ttk.Label(f, text="", foreground="blue")
+        self.mask_progress_label.grid(row=5, column=1, sticky="w", padx=4)
+        self.mask_progress_label.grid_remove()
+        self.mask_output_discovery = self._create_output_discovery_buttons(f, self.mask_out, row=6, col=1)
+        self.mask_output_discovery.grid_remove()
 
-        btn_one_click = ttk.Button(f, text="One-Click: Crop → Mask → Autolabel", command=self._do_crop_mask_autolabel)
-        btn_one_click.grid(row=5, column=1, sticky="e", pady=10)
-        ToolTip(btn_one_click, "Automated workflow: crop borders, apply mask, then run autolabeling.\nRequires ROI JSON to be configured.")
+        btn_frame = ttk.Frame(f)
+        btn_frame.grid(row=7, column=1, sticky="e", pady=6)
+        self.btn_mask = ttk.Button(btn_frame, text="Apply Mask to Sampled Images", command=self._do_mask)
+        self.btn_mask.pack(side="left", padx=4)
+        ToolTip(self.btn_mask, "Apply ROI mask to all sampled images.\nPixels outside ROI zones will be masked out.")
+        self.btn_one_click = ttk.Button(btn_frame, text="One-Click: Crop → Mask → Autolabel", command=self._do_crop_mask_autolabel)
+        self.btn_one_click.pack(side="left", padx=4)
+        ToolTip(self.btn_one_click, "Automated workflow: crop borders, apply mask, then run autolabeling.\nRequires ROI JSON to be configured.")
+        self.btn_mask_cancel = ttk.Button(btn_frame, text="Cancel", command=self._cancel_current_task, state="disabled")
+        self.btn_mask_cancel.pack(side="left", padx=4)
         return f
 
     def _launch_roi_tool(self):
@@ -1310,47 +1392,80 @@ class TrafficStudio(tk.Tk):
         )
         if not vid_or_img:
             return
-        args = [sys.executable, "-u", "third_party/roi_tool_gui.py", vid_or_img]
+        args = [sys.executable, "-u", str(APP_DIR / "third_party" / "roi_tool_gui.py"),
+                str(Path(vid_or_img).resolve())]
         try:
-            subprocess.Popen(args)
+            subprocess.Popen(args, cwd=str(self.project.root))
             self.focus_set()
         except Exception as e:
             messagebox.showerror("ROI Tool", f"Failed to launch ROI tool:\n{e}")
 
-    def _do_mask(self):
-        from studio import roi_utils
-        import cv2
+    def _do_mask(self, then_autolabel: bool = False):
+        """Crop (optional) and mask the sampled images on a worker thread, in parallel."""
+        self._sync_project_from_ui()
         src_images = Path(self.sample_out.get())
-        images_for_mask = src_images
-        if self.crop_toggle.get():
+        if not src_images.is_dir():
+            messagebox.showerror("Mask", f"Images folder not found:\n{src_images}")
+            return
+        roi_path = Path(self.roi_json.get()) if self.roi_json.get() else None
+        if not roi_path or not roi_path.is_file():
+            messagebox.showerror("Mask", "Select an ROI JSON first (use the ROI Tool to create one).")
+            return
+        try:
             margin = float(self.crop_margin.get() or "0.10")
-            labels_dir = Path(self.crop_labels_dir.get()) if self.crop_labels_dir.get() else None
-            cropped_dir = src_images.with_name(src_images.name + "_cropped")
-            out_lbl = None
-            if labels_dir:
-                out_lbl = cropped_dir.parent / "labels" / cropped_dir.name
-            n_img, n_lbl = roi_utils.crop_margin_and_relabel(src_images, cropped_dir, labels_dir, out_lbl, margin_frac=margin)
-            log.info("Border-cropped %d images, rewrote %d label files -> %s", n_img, n_lbl, cropped_dir)
-            images_for_mask = cropped_dir
+            if not 0.0 <= margin < 0.5:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Mask", "Crop margin must be a number between 0 and 0.5.")
+            return
+        do_crop = bool(self.crop_toggle.get())
+        labels_dir = Path(self.crop_labels_dir.get()) if self.crop_labels_dir.get() else None
+        out_dir = Path(self.mask_out.get())
 
-        # Build union mask and apply to folder
-        probe = next(iter(sorted(images_for_mask.glob("*.jpg"))), None) or next(iter(sorted(images_for_mask.glob("*.png"))), None)
-        if not probe:
-            messagebox.showwarning("No images", f"No images in {images_for_mask}"); return
-        im = cv2.imread(str(probe)); h, w = im.shape[:2]
-        rois = roi_utils.load_roi_any(Path(self.roi_json.get()))
-        flat = {name: spec["points"] for name, spec in rois.items() if spec.get("include", True)}
-        mask = roi_utils.mask_from_rois(flat, w, h)
-        out_dir = Path(self.mask_out.get()); out_dir.mkdir(parents=True, exist_ok=True)
-        for p in sorted(images_for_mask.glob("*.*")):
-            if p.suffix.lower() not in (".jpg",".jpeg",".png",".bmp",".tif",".tiff"): continue
-            roi_utils.apply_mask_to_image(p, out_dir / p.name, mask)
-        log.info("Masked images -> %s", out_dir)
+        def _run(progress_callback=None, cancel_check=None):
+            def prog(frac, msg, lo=0.0, hi=1.0):
+                if progress_callback:
+                    progress_callback(lo + (hi - lo) * frac, msg)
+
+            images_for_mask = src_images
+            if do_crop:
+                cropped_dir = src_images.with_name(src_images.name + "_cropped")
+                out_lbl = cropped_dir.parent / "labels" / cropped_dir.name if labels_dir else None
+                n_img, n_lbl = roi_utils.crop_margin_and_relabel(
+                    src_images, cropped_dir, labels_dir, out_lbl, margin_frac=margin,
+                    progress_callback=lambda f, m: prog(f, f"Cropping {m}", 0.0, 0.5),
+                    cancel_check=cancel_check)
+                log.info("Border-cropped %d images, rewrote %d label files -> %s", n_img, n_lbl, cropped_dir)
+                if cancel_check and cancel_check():
+                    return None
+                images_for_mask = cropped_dir
+            mask = roi_utils.mask_for_images(images_for_mask, roi_path)
+            res = roi_utils.mask_images(
+                images_for_mask, out_dir, mask,
+                progress_callback=lambda f, m: prog(f, f"Masking {m}", 0.5 if do_crop else 0.0, 1.0),
+                cancel_check=cancel_check)
+            log.info("Masked %d images -> %s", res["images"], out_dir)
+            return res
+
+        def on_success_mask(res):
+            self.project.steps_completed.update({"roi_mask": True})
+            self._update_workflow_status()
+            if then_autolabel:
+                self.auto_images.set(str(out_dir))
+                self._do_autolabel()
+
+        self._run_task(
+            _run, "Mask",
+            on_success=on_success_mask,
+            progress_bar=self.mask_progress,
+            progress_label=self.mask_progress_label,
+            run_button=[self.btn_mask, self.btn_one_click],
+            cancel_button=self.btn_mask_cancel,
+            output_discovery=self.mask_output_discovery,
+        )
 
     def _do_crop_mask_autolabel(self):
-        self._do_mask()
-        self.auto_images.set(self.mask_out.get())
-        self._do_autolabel()
+        self._do_mask(then_autolabel=True)
 
     # ---------- Step 3: Autolabel ----------
     def _step_autolabel(self, parent):
@@ -1500,16 +1615,19 @@ class TrafficStudio(tk.Tk):
         imgsz = int(self.imgsz.get())
         iou = float(self.iou.get())
 
-        def _run():
-            res = autolabel.autolabel(images_dir, model_path=model_path, imgsz=imgsz, conf=conf, iou=iou)
-            base = Path("runs/autolabel")
-            latest = sorted(base.glob("*/labels"), key=lambda p: p.stat().st_mtime)
-            if latest:
-                self.labels_dir.set(str(latest[-1]))
-                log.info("Latest labels -> %s", latest[-1])
-            return res
+        root = self.project.root
+        project_dir = self.project.resolve(self.autolabel_out.get() or "runs/autolabel")
+
+        def _run(progress_callback=None, cancel_check=None):
+            return autolabel.autolabel(images_dir, model_path=model_path, imgsz=imgsz, conf=conf, iou=iou,
+                                       project=project_dir, search_root=root,
+                                       progress_callback=progress_callback, cancel_check=cancel_check)
 
         def on_success_autolabel(res):
+            labels_dir = res.get("labels_dir") if isinstance(res, dict) else None
+            if labels_dir:
+                self.labels_dir.set(str(labels_dir))
+                log.info("Latest labels -> %s", labels_dir)
             self.project.steps_completed.update({"autolabel": True})
             self.project.workflow_state["has_labels"] = True
             if self.labels_dir.get():
@@ -1953,10 +2071,15 @@ class TrafficStudio(tk.Tk):
             messagebox.showerror("Invalid Split Ratios", f"Ratios sum to {tr+va+te:.2f} — they should sum to ~1.0.")
             return
         classes_txt = Path(self.classes_file.get()) if self.classes_file.get() else None
+
+        def on_success_splits(res):
+            data_yaml = (res or {}).get("data_yaml") or str(out_root / "data.yaml")
+            self.train_data_yaml.set(str(data_yaml))
+
         self._run_task(lambda: qaqc.make_site_disjoint_splits(images_root, labels_root, out_root,
                                                               train=tr, val=va, test=te, site_regex=site_regex,
-                                                              copy=True, classes_txt=classes_txt), "Make Splits")
-        self.train_data_yaml.set(str(out_root / "data.yaml"))
+                                                              copy=True, classes_txt=classes_txt), "Make Splits",
+                       on_success=on_success_splits)
 
     def _do_write_fhwa_template(self):
         out_csv = Path(self.split_out_root.get()) / "fhwa_mapping.csv"
@@ -2186,9 +2309,21 @@ class TrafficStudio(tk.Tk):
         self.train_status_label = ttk.Label(f, text="", font=("", 9))
         self.train_status_label.grid(row=4, column=1, sticky="w", padx=4, pady=(4,0))
 
-        btn_train = ttk.Button(f, text="Start Training", command=self._do_train)
-        btn_train.grid(row=5, column=1, sticky="e", pady=8)
-        ToolTip(btn_train, "Begin model training.\nMonitor progress in the log.\nBest weights saved to runs/detect/{run_name}/weights/best.pt")
+        self.train_progress = ttk.Progressbar(f, mode='indeterminate', length=300)
+        self.train_progress.grid(row=5, column=1, sticky="ew", padx=4, pady=4)
+        self.train_progress.grid_remove()
+        self.train_progress_label = ttk.Label(f, text="", foreground="blue")
+        self.train_progress_label.grid(row=6, column=1, sticky="w", padx=4)
+        self.train_progress_label.grid_remove()
+
+        btn_frame = ttk.Frame(f)
+        btn_frame.grid(row=7, column=1, sticky="e", pady=8)
+        self.btn_train = ttk.Button(btn_frame, text="Start Training", command=self._do_train)
+        self.btn_train.pack(side="left", padx=4)
+        ToolTip(self.btn_train, "Begin model training.\nMonitor progress in the log.\nBest weights saved to runs/detect/{run_name}/weights/best.pt")
+        self.btn_train_cancel = ttk.Button(btn_frame, text="Cancel", command=self._cancel_current_task, state="disabled")
+        self.btn_train_cancel.pack(side="left", padx=4)
+        ToolTip(self.btn_train_cancel, "Stop training at the end of the current epoch.\nThe last checkpoint is kept.")
         return f
 
     def _do_train(self):
@@ -2211,7 +2346,7 @@ class TrafficStudio(tk.Tk):
             imgsz = int(float(self.t_imgsz.get()))
             epochs = int(float(self.t_epochs.get()))
             batch = int(float(self.t_batch.get()))
-            device = int(float(self.t_device.get()))
+            device = self.t_device.get().strip() or "auto"   # 'auto', 'cpu', or a CUDA index
             workers = int(float(self.t_workers.get()))
             mosaic = float(self.t_mosaic.get())
             mixup = float(self.t_mixup.get())
@@ -2247,22 +2382,33 @@ class TrafficStudio(tk.Tk):
             messagebox.showerror("Invalid Parameters", "\n".join(errors))
             return
 
+        project_dir = self.project.root / "runs" / "detect"
+
+        def _run(progress_callback=None, cancel_check=None):
+            return trainer.train(weights=weights, data_yaml=data_yaml, name=run_name, project=project_dir,
+                                 imgsz=imgsz, epochs=epochs, batch=batch,
+                                 device=device, workers=workers,
+                                 mosaic=mosaic, mixup=mixup, copy_paste=copy_paste,
+                                 degrees=degrees, fl_gamma=fl_gamma,
+                                 warmup_epochs=warmup, close_mosaic=close_mosaic,
+                                 lr0=lr0, lrf=lrf, freeze=freeze, optimizer=optimizer,
+                                 cos_lr=cos_lr,
+                                 progress_callback=progress_callback, cancel_check=cancel_check)
+
         def on_success_train(res):
             self.project.steps_completed.update({"train": True})
             self.project.workflow_state["has_trained_model"] = True
-            weights_path = Path(f"runs/detect/{run_name}/weights/best.pt")
+            best = res.get("best") if isinstance(res, dict) else None
+            weights_path = Path(best) if best else project_dir / run_name / "weights" / "best.pt"
             if weights_path.exists():
                 self.project.workflow_state["trained_weights"] = str(weights_path)
+                if not self.an_weights.get():
+                    self.an_weights.set(str(weights_path))
             self._update_workflow_status()
 
-        self._run_task(lambda: trainer.train(weights=weights, data_yaml=data_yaml, name=run_name,
-                                             imgsz=imgsz, epochs=epochs, batch=batch,
-                                             device=device, workers=workers,
-                                             mosaic=mosaic, mixup=mixup, copy_paste=copy_paste,
-                                             degrees=degrees, fl_gamma=fl_gamma,
-                                             warmup_epochs=warmup, close_mosaic=close_mosaic,
-                                             lr0=lr0, lrf=lrf, freeze=freeze, optimizer=optimizer,
-                                             cos_lr=cos_lr), "Training", on_success=on_success_train)
+        self._run_task(_run, "Training", on_success=on_success_train,
+                       progress_bar=self.train_progress, progress_label=self.train_progress_label,
+                       run_button=self.btn_train, cancel_button=self.btn_train_cancel)
 
     # ---------- Step 6: Analyze ----------
     def _step_analyze(self, parent):
@@ -2314,13 +2460,52 @@ class TrafficStudio(tk.Tk):
         ent_lane_pattern = ttk.Entry(lane_box, textvariable=self.lane_pattern)
         ent_lane_pattern.grid(row=1, column=1, sticky="ew")
 
-        # Status indicator
-        self.analyze_status_label = ttk.Label(lane_box, text="", font=("", 9))
-        self.analyze_status_label.grid(row=2, column=0, columnspan=2, sticky="w", padx=4, pady=(4,0))
+        inf = ttk.LabelFrame(f, text="Inference")
+        inf.grid(row=6, column=0, columnspan=3, sticky="ew", padx=4, pady=(6,4))
+        inf.columnconfigure(3, weight=1)
+        lbl_an_imgsz = ttk.Label(inf, text="imgsz"); lbl_an_imgsz.grid(row=0, column=0, sticky="e", padx=4, pady=2)
+        ToolTip(lbl_an_imgsz, "Inference image size (multiple of 32).\nHigher = more detail, slower.")
+        self.ent_an_imgsz = ValidatedEntry(inf, self.an_imgsz,
+            validator=lambda v: FieldValidator.is_int(v, min_val=320, max_val=2048), required=True, width=10)
+        self.ent_an_imgsz.grid(row=0, column=1, sticky="w")
+        lbl_an_conf = ttk.Label(inf, text="conf"); lbl_an_conf.grid(row=1, column=0, sticky="e", padx=4, pady=2)
+        ToolTip(lbl_an_conf, "Detection confidence threshold (0-1).\nLower than for autolabeling: the tracker filters noise.")
+        self.ent_an_conf = ValidatedEntry(inf, self.an_conf,
+            validator=lambda v: FieldValidator.is_float(v, min_val=0.0, max_val=1.0), required=True, width=10)
+        self.ent_an_conf.grid(row=1, column=1, sticky="w")
+        lbl_an_iou = ttk.Label(inf, text="iou"); lbl_an_iou.grid(row=2, column=0, sticky="e", padx=4, pady=2)
+        ToolTip(lbl_an_iou, "NMS IoU threshold (0-1).")
+        self.ent_an_iou = ValidatedEntry(inf, self.an_iou,
+            validator=lambda v: FieldValidator.is_float(v, min_val=0.0, max_val=1.0), required=True, width=10)
+        self.ent_an_iou.grid(row=2, column=1, sticky="w")
+        lbl_an_device = ttk.Label(inf, text="device"); lbl_an_device.grid(row=3, column=0, sticky="e", padx=4, pady=2)
+        ToolTip(lbl_an_device, "'auto' uses the GPU when available, otherwise CPU.\nOr 'cpu', or a CUDA index such as 0.")
+        ttk.Entry(inf, width=10, textvariable=self.an_device).grid(row=3, column=1, sticky="w")
+        chk_video = ttk.Checkbutton(inf, text="Write annotated video", variable=self.an_write_video)
+        chk_video.grid(row=0, column=3, rowspan=2, sticky="w", padx=12)
+        ToolTip(chk_video, "Encode an annotated .mp4 next to the CSVs.\nUncheck for a much faster run that only writes the CSV reports.")
 
-        btn_analyze = ttk.Button(lane_box, text="Run Analysis", command=self._do_analyze)
-        btn_analyze.grid(row=3, column=2, sticky="e", pady=6)
-        ToolTip(btn_analyze, "Start traffic analysis with vehicle tracking.\nGenerates movement reports, counts, and CSV outputs.\nMay take several minutes for long videos.")
+        self.analyze_output_discovery = self._create_output_discovery_buttons(f, self.an_out, row=7, col=1)
+        self.analyze_output_discovery.grid_remove()
+        self.analyze_progress = ttk.Progressbar(f, mode='indeterminate', length=300)
+        self.analyze_progress.grid(row=8, column=1, sticky="ew", padx=4, pady=4)
+        self.analyze_progress.grid_remove()
+        self.analyze_progress_label = ttk.Label(f, text="", foreground="blue")
+        self.analyze_progress_label.grid(row=9, column=1, sticky="w", padx=4)
+        self.analyze_progress_label.grid_remove()
+
+        # Status indicator
+        self.analyze_status_label = ttk.Label(f, text="", font=("", 9))
+        self.analyze_status_label.grid(row=10, column=1, sticky="w", padx=4, pady=(4,0))
+
+        btn_frame = ttk.Frame(f)
+        btn_frame.grid(row=11, column=1, sticky="e", pady=6)
+        self.btn_analyze = ttk.Button(btn_frame, text="Run Analysis", command=self._do_analyze)
+        self.btn_analyze.pack(side="left", padx=4)
+        ToolTip(self.btn_analyze, "Start traffic analysis with vehicle tracking.\nGenerates movement reports, counts, and CSV outputs.\nMay take several minutes for long videos.")
+        self.btn_analyze_cancel = ttk.Button(btn_frame, text="Cancel", command=self._cancel_current_task, state="disabled")
+        self.btn_analyze_cancel.pack(side="left", padx=4)
+        ToolTip(self.btn_analyze_cancel, "Stop after the current frame.\nTracks seen so far are still written.")
         return f
 
     def _do_analyze(self):
@@ -2336,23 +2521,46 @@ class TrafficStudio(tk.Tk):
                     return
 
         video = Path(self.an_video.get())
-        roi = Path(self.roi_json.get())
-        weights = self.an_weights.get().strip() or "yolov8n.pt"
-        out_dir = Path(self.an_out.get()); out_dir.mkdir(parents=True, exist_ok=True)
+        roi = Path(self.roi_json.get()) if self.roi_json.get() else None
+        if not roi or not roi.is_file():
+            messagebox.showerror("Analyze", "Select an ROI JSON first (use the ROI Tool to create one).")
+            return
+        weights = (self.an_weights.get().strip()
+                   or self.project.workflow_state.get("trained_weights")
+                   or "yolov8n.pt")
+        if not (self.ent_an_imgsz.is_valid and self.ent_an_conf.is_valid and self.ent_an_iou.is_valid):
+            messagebox.showerror("Analyze", "Check the inference parameters (imgsz, conf, iou).")
+            return
+        imgsz = int(self.an_imgsz.get())
+        conf = float(self.an_conf.get())
+        iou = float(self.an_iou.get())
+        device = self.an_device.get().strip() or "auto"
+        write_video = bool(self.an_write_video.get())
+        out_dir = self.project.resolve(self.an_out.get() or "outputs")
         run_name = self.an_run.get().strip() or "analysis_run"
         include_lanes = bool(self.include_lanes.get())
-        lane_pattern = self.lane_pattern.get().strip()
+        lane_pattern = self.lane_pattern.get().strip() or analyzer.DEFAULT_LANE_PATTERN
+        try:
+            re.compile(lane_pattern)
+        except re.error as e:
+            messagebox.showerror("Analyze", f"Lane regex is invalid: {e}")
+            return
 
-        def _run():
-            flat_json = roi_utils.flatten_for_analysis(roi, out_dir / f"{run_name}_flat_rois.json",
-                                                       include_lanes=include_lanes, lane_pattern=lane_pattern)
-            return analyzer.analyze(video, weights, out_dir, run_name, flat_json, imgsz=960, conf=0.25, iou=0.50)
+        def _run(progress_callback=None, cancel_check=None):
+            return analyzer.analyze_video(video, weights, roi, out_dir, run_name=run_name,
+                                          imgsz=imgsz, conf=conf, iou=iou, device=device,
+                                          include_lane_rois=include_lanes, lane_pattern=lane_pattern,
+                                          write_video=write_video,
+                                          progress_callback=progress_callback, cancel_check=cancel_check)
 
         def on_success_analyze(res):
             self.project.steps_completed.update({"analyze": True})
             self._update_workflow_status()
 
-        self._run_task(_run, "Analyze", on_success=on_success_analyze)
+        self._run_task(_run, "Analyze", on_success=on_success_analyze,
+                       progress_bar=self.analyze_progress, progress_label=self.analyze_progress_label,
+                       run_button=self.btn_analyze, cancel_button=self.btn_analyze_cancel,
+                       output_discovery=self.analyze_output_discovery)
 
     # ----- Plumbing -----
     def _drain_logs(self):
@@ -2364,6 +2572,24 @@ class TrafficStudio(tk.Tk):
         except queue.Empty:
             pass
         self.after(150, self._drain_logs)
+
+    def _post_to_ui(self, fn: Callable[[], None]):
+        """Hand a callable to the Tk thread. Worker threads must never touch widgets,
+        and calling Tk's after() from another thread is only tolerated inside mainloop,
+        so everything goes through this queue instead."""
+        self._ui_queue.put(fn)
+
+    def _drain_ui(self):
+        try:
+            while True:
+                fn = self._ui_queue.get_nowait()
+                try:
+                    fn()
+                except Exception:
+                    log.exception("UI update failed")
+        except queue.Empty:
+            pass
+        self.after(50, self._drain_ui)
 
     def _run_task(self, fn, title, on_success: Optional[Callable] = None,
                   progress_bar: Optional[ttk.Progressbar] = None,
@@ -2389,62 +2615,72 @@ class TrafficStudio(tk.Tk):
             messagebox.showwarning(title, "Another task is already running. Please wait or cancel it first.")
             return
 
-        # Show progress UI
+        run_buttons = [b for b in (run_button if isinstance(run_button, (list, tuple)) else [run_button]) if b]
+
+        # Show progress UI. The bar starts indeterminate and switches to a real
+        # percentage as soon as the task reports a fraction.
         if progress_bar:
+            progress_bar.config(mode="indeterminate", value=0)
             progress_bar.grid()
             progress_bar.start()
         if progress_label:
             progress_label.grid()
-            progress_label.config(text="Starting...")
-        if run_button:
-            run_button.config(state="disabled")
+            progress_label.config(text="Starting...", foreground="blue")
+        for b in run_buttons:
+            b.config(state="disabled")
         if cancel_button:
             cancel_button.config(state="normal")
 
-        def on_progress(fraction: float, message: str):
-            """Update progress UI on main thread."""
+        def _show_progress(fraction, message: str):
+            if progress_bar and fraction:
+                if str(progress_bar.cget("mode")) != "determinate":
+                    progress_bar.stop()
+                    progress_bar.config(mode="determinate", maximum=100)
+                progress_bar.config(value=max(0.0, min(100.0, fraction * 100)))
             if progress_label:
-                self.after(0, lambda: progress_label.config(text=message))
+                pct = f"{int(fraction * 100)}%  " if fraction else ""
+                progress_label.config(text=f"{pct}{message}")
 
-        def on_done(success, result, cancelled=False):
-            """Cleanup and finalize UI state."""
-            # Hide progress UI
+        def on_progress(fraction: float, message: str):
+            """Called from the worker thread; marshal to the Tk thread."""
+            self._post_to_ui(lambda: _show_progress(fraction, message))
+
+        def _finish_ui(success, result, cancelled):
+            """Runs on the Tk thread: every widget update and the success callback live here."""
+            if self.current_worker is worker:
+                self.current_worker = None
             if progress_bar:
-                self.after(0, lambda: progress_bar.stop())
-                self.after(0, lambda: progress_bar.grid_remove())
+                progress_bar.stop()
+                progress_bar.config(mode="indeterminate", value=0)
+                progress_bar.grid_remove()
             if progress_label:
                 if cancelled:
-                    self.after(0, lambda: progress_label.config(text="Cancelled", foreground="orange"))
+                    progress_label.config(text="Cancelled", foreground="orange")
                 elif success:
-                    self.after(0, lambda: progress_label.config(text="✓ Complete", foreground="green"))
+                    progress_label.config(text="✓ Complete", foreground="green")
                 else:
-                    self.after(0, lambda: progress_label.config(text="✗ Failed", foreground="red"))
-
-            # Re-enable buttons
-            if run_button:
-                self.after(0, lambda: run_button.config(state="normal"))
+                    progress_label.config(text="✗ Failed", foreground="red")
+            for b in run_buttons:
+                b.config(state="normal")
             if cancel_button:
-                self.after(0, lambda: cancel_button.config(state="disabled"))
-
-            # Show output discovery buttons on success
+                cancel_button.config(state="disabled")
             if success and output_discovery:
-                self.after(0, lambda: output_discovery.grid())
-
-            # Log result
+                output_discovery.grid()
             if cancelled:
                 log.warning("%s — cancelled by user.", title)
             elif success:
                 log.info("%s — done.", title)
                 if on_success:
-                    on_success(result)
+                    try:
+                        on_success(result)
+                    except Exception:
+                        log.exception("%s — post-processing failed", title)
             else:
-                self.after(0, lambda: messagebox.showerror(title, "Task failed. See log for details."))
+                messagebox.showerror(title, "Task failed. See log for details.")
 
-            # Clear current worker reference on main thread (avoid race with new task)
-            def _clear_worker():
-                if self.current_worker is worker:
-                    self.current_worker = None
-            self.after(0, _clear_worker)
+        def on_done(success, result, cancelled=False):
+            """Called from the worker thread. Tkinter is not thread-safe, so hand everything to the Tk thread."""
+            self._post_to_ui(lambda: _finish_ui(success, result, cancelled))
 
         # Start worker
         worker = Worker(fn, on_done, log, on_progress=on_progress)
@@ -2465,6 +2701,7 @@ class TrafficStudio(tk.Tk):
                     "The running task will be terminated."):
                 return
             self.current_worker.cancel()
+            self.current_worker.join(timeout=5)   # lets ffmpeg / the current frame finish cleanly
         self.destroy()
 
     def _choose_file(self, var, types):
@@ -2484,8 +2721,5 @@ class TrafficStudio(tk.Tk):
             var.set(p)
 
 if __name__ == "__main__":
-    try:
-        import cv2
-    except Exception:
-        pass
+    multiprocessing.freeze_support()  # PyInstaller builds spawn dataloader workers through here
     TrafficStudio().mainloop()

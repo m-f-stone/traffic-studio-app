@@ -141,6 +141,16 @@ python app.py
 
 The GUI features an accordion-style interface where each section can be expanded or collapsed for easy navigation.
 
+Every step runs on a worker thread with a real progress bar and a working **Cancel** button:
+sampling terminates ffmpeg, masking and auto-labeling stop after the current image, training stops
+at the end of the current epoch (keeping that checkpoint), and analysis stops after the current frame
+and still writes the tracks seen so far. Opening or saving a project makes its folder the working
+directory, so relative paths such as `data/`, `runs/` and `outputs/` resolve the same way everywhere.
+
+The annotated analysis video is optional (**Write annotated video** in the Analyze step). When
+ffmpeg is on PATH it is encoded with libx264, which is several times faster than OpenCV's built-in
+encoder at full resolution; untick it for counts-only runs.
+
 **Programmatic Usage** (new architecture):
 ```python
 from pathlib import Path
@@ -261,8 +271,7 @@ Core dependencies (see [requirements.txt](requirements.txt) for exact versions):
 - **numpy**: Numerical operations
 - **pillow**: Image manipulation
 - **shapely**: Geometric operations for ROI
-- **filterpy**: Kalman filtering for tracking
-- **lap**: Linear assignment problem solver for tracking
+- **lap**: Linear assignment problem solver used by the ultralytics trackers (ByteTrack / BoT-SORT)
 
 ## Project Structure
 
@@ -307,6 +316,7 @@ traffic_studio_accordion/
 │   ├── autolabel.py               # Auto-labeling with YOLO
 │   ├── trainer.py                 # Model training
 │   ├── analyzer.py                # Traffic analysis and tracking
+│   ├── devices.py                 # CUDA/CPU device resolution
 │   ├── qaqc.py                    # Quality control tools
 │   ├── threads.py                 # Background worker threads
 │   ├── logutil.py                 # Logging utilities
@@ -403,6 +413,8 @@ black traffic_studio/ tests/
 5. **Training**: Start with a pre-trained YOLOv8s model for faster convergence
 6. **Augmentation**: Reduce augmentation if training on consistent lighting conditions
 7. **Site-Disjoint Splits**: Use site-based splitting to prevent data leakage
+8. **Analysis Throughput**: Untick *Write annotated video* when you only need the CSVs, and export
+   the model to TensorRT (`yolo export model=best.pt format=engine`) for 2-3x faster inference on NVIDIA GPUs
 
 ### Architecture (New)
 1. **Use Container**: Always create services through the Container for proper dependency injection

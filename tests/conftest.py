@@ -1,9 +1,13 @@
 """Pytest configuration and fixtures."""
 
+import sys
 import pytest
 from pathlib import Path
 from logging import Logger
 import tempfile
+
+# Make the project root importable regardless of how pytest is invoked.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from traffic_studio.container import Container
 from traffic_studio.utils.logging import create_logger

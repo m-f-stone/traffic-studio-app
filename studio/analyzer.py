@@ -1,9 +1,20 @@
 # studio/analyzer.py
+"""Traffic analysis entry point: flatten the ROI template, run tracking, and
+post-process per-track results into approach / left-through-right labels."""
+from __future__ import annotations
+
+import csv
+import re
 from pathlib import Path
-import csv, re
-from .roi_utils import normalize_for_tracking
+from typing import Callable, Optional
+
 from .logutil import setup_logger
+from .roi_utils import normalize_for_tracking
+
 log = setup_logger()
+
+DEFAULT_TRACKER = "bytetrack.yaml"   # ultralytics ships bytetrack.yaml and botsort.yaml
+DEFAULT_LANE_PATTERN = r"(lane|_ln|\b[ltr]\b|through|left|right)"
 
 # --- helpers to read cardinal approach from ROI names ---
 _CARDINALS = {
@@ -54,7 +65,7 @@ def _postprocess_ltr(out_dir: Path, run_name: str):
     out_tracks = out_dir / f"{run_name}_tracks_ltr.csv"
     agg = {}  # (approach, turn, class) -> count
 
-    with tracks_csv.open("r", newline="", encoding="utf-8") as f, \
+    with tracks_csv.open("r", newline="", encoding="utf-8-sig") as f, \
          out_tracks.open("w", newline="", encoding="utf-8") as g:
         r = csv.DictReader(f)
         fieldnames = list(r.fieldnames) + ["movement_ltr", "approach"]
@@ -64,7 +75,6 @@ def _postprocess_ltr(out_dir: Path, run_name: str):
             entry = row.get("entry_roi","") or ""
             exitr = row.get("exit_roi","") or ""
             approach, turn = _ltr_from(entry, exitr)
-            ltr = f"{approach or 'NA'}-{turn or 'Unknown'}"
             row["approach"] = approach or ""
             row["movement_ltr"] = turn or "Unknown"
             w.writerow(row)
@@ -83,26 +93,41 @@ def _postprocess_ltr(out_dir: Path, run_name: str):
 
     log.info("Wrote LTR files:\n  %s\n  %s", out_tracks, out_mov)
 
+
 def analyze_video(video: Path, model_path: Path, roi_json_template: Path,
-                  out_dir: Path, run_name="analysis", tracker="strongsort.yaml",
-                  imgsz=640, conf=0.30, iou=0.50, device=0,
-                  include_lane_rois: bool=False, lane_pattern: str=r"(lane|_ln|\b[ltr]\b|through|left|right)"):
+                  out_dir: Path, run_name="analysis", tracker=DEFAULT_TRACKER,
+                  imgsz=640, conf=0.30, iou=0.50, device=None,
+                  include_lane_rois: bool = False, lane_pattern: str = DEFAULT_LANE_PATTERN,
+                  write_video: bool = True,
+                  progress_callback: Optional[Callable[[float, str], None]] = None,
+                  cancel_check: Optional[Callable[[], bool]] = None) -> dict:
     """
-    Normalizes ROI JSON (template → flat), optionally forcing lane-ROIs 'include'=True
-    for names matching `lane_pattern`, then runs your analyzer. Finally, post-process
-    per-track results to add approach/L/T/R labels and an aggregate CSV.
+    Normalizes the ROI JSON (template -> flat), optionally forcing lane ROIs to
+    include=True for names matching `lane_pattern`, runs tracking, then
+    post-processes per-track results into approach / L-T-R labels plus an
+    aggregate CSV.
+
+    device None/'auto' picks CUDA when available, otherwise CPU. On cancel the
+    tracks seen so far are still written and post-processed.
+
+    Returns a dict with the output paths and a "cancelled" flag.
     """
     from third_party.traffic_analysis_tracking import run_analysis
 
+    out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Normalize ROI JSON for tracking script
+    if progress_callback:
+        progress_callback(0.0, "Preparing ROIs")
     flat_json = out_dir / f"{run_name}_rois_flat.json"
-    normalize_for_tracking(roi_json_template, flat_json,
+    normalize_for_tracking(Path(roi_json_template), flat_json,
                            include_lanes=include_lane_rois,
                            lane_pattern=lane_pattern)
 
-    # Run tracking analysis via direct-call API (thread-safe)
-    run_analysis(
+    def _tracking_progress(frac: float, msg: str):
+        if progress_callback:
+            progress_callback(0.02 + 0.93 * frac, msg)
+
+    out = run_analysis(
         input_video=str(video),
         model=str(model_path),
         output=str(out_dir),
@@ -112,8 +137,25 @@ def analyze_video(video: Path, model_path: Path, roi_json_template: Path,
         imgsz=imgsz,
         conf=conf,
         iou=iou,
-        device=device
+        device=device,
+        write_video=write_video,
+        progress_callback=_tracking_progress,
+        cancel_check=cancel_check,
     )
 
-    # Post-process to add L/T/R
+    if progress_callback:
+        progress_callback(0.96, "Classifying movements (L/T/R)")
     _postprocess_ltr(out_dir, run_name)
+
+    cancelled = bool(out.get("cancelled"))
+    if progress_callback:
+        progress_callback(1.0, "Analysis cancelled; partial results written" if cancelled else "Analysis complete")
+    return {
+        "tracks_csv": out["tracks_csv"],
+        "movements_csv": out["movements_csv"],
+        "tracks_ltr_csv": out_dir / f"{run_name}_tracks_ltr.csv",
+        "movements_ltr_csv": out_dir / f"{run_name}_movements_ltr.csv",
+        "video": out.get("video"),
+        "frames": out.get("frames", 0),
+        "cancelled": cancelled,
+    }

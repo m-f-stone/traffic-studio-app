@@ -91,7 +91,9 @@ class AnalyzerService:
                 imgsz=config.imgsz,
                 conf=config.conf,
                 iou=config.iou,
-                device=config.device
+                device=config.device,
+                progress_callback=(lambda f, m: progress_callback(0.2 + 0.6 * f, m)) if progress_callback else None,
+                cancel_check=cancel_check,
             )
 
         except Exception as e:
